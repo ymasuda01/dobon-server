@@ -115,7 +115,21 @@ io.on('connection', (socket) => {
       });
     });
   });
+  // 3. 誰かがカードを出したとき（相手の画面に中継）
+  socket.on('play_card', ({ roomId, card, designatedSuit }) => {
+    socket.to(roomId).emit('card_played_sync', {
+      senderId: socket.id,
+      card: card,
+      designatedSuit: designatedSuit
+    });
+  });
 
+  // 4. 誰かが山札を引いたとき（相手の画面に中継）
+  socket.on('draw_card', ({ roomId }) => {
+    socket.to(roomId).emit('card_drawn_sync', {
+      senderId: socket.id
+    });
+  });
   socket.on('disconnect', () => {
     console.log('切断:', socket.id);
   });
