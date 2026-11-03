@@ -124,14 +124,41 @@ io.on('connection', (socket) => {
     });
   });
 
-  // 4. 誰かが山札を引いたとき（相手の画面に中継）
-  socket.on('draw_card', ({ roomId }) => {
-    socket.to(roomId).emit('card_drawn_sync', {
-      senderId: socket.id
+  // 4. 誰かが山札を引いたとき（本物のカードを渡す）
+  socket.on('draw_card', ({ roomId, count }) => {
+    const room = rooms[roomId];
+    if (!room) return;
+
+    const drawCount = count || 1;
+    const drawnCards = [];
+
+    for (let i = 0; i < drawCount; i++) {
+      // 山札が切れたら捨て札をシャッフルして補充
+      if (room.deck.length === 0 && room.discardHistory.length > 1) {
+        const top = room.discardHistory.pop();
+        room.deck = room.discardHistory.slice();
+        room.discardHistory = [top];
+        for (let j = room.deck.length - 1; j > 0; j--) {
+          const r = Math.floor(Math.random() * (j + 1));
+          [room.deck[j], room.deck[r]] = [room.deck[r], room.deck[j]];
+        }
+      }
+      if (room.deck.length > 0) {
+        drawnCards.push(room.deck.pop());
+      }
+    }
+
+    // 引いた本人には「本物のカードデータ」を届ける！
+    socket.emit('my_card_drawn', {
+      cards: drawnCards,
+      deckCount: room.deck.length
     });
-  });
-  socket.on('disconnect', () => {
-    console.log('切断:', socket.id);
+
+    // 部屋の相手には「引いた枚数」だけ通知してターンを回す！
+    socket.to(roomId).emit('card_drawn_sync', {
+      drawCount: drawnCards.length,
+      deckCount: room.deck.length
+    });
   });
 });
 
