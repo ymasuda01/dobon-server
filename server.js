@@ -1,4 +1,9 @@
-// DOBON Realtime Game Server (Lobby, Auto-CPU & Complete Sync Engine)
+/**
+ * DOBON Realtime Game Server
+ * Game Version: 2026.00.001
+ * File Version: server.js v0.1.0
+ */
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -12,11 +17,13 @@ const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
+const GAME_VERSION = "2026.00.001";
+const FILE_VERSION = "server.js v0.1.0";
+
 app.get('/', (req, res) => {
-  res.send('DOBON Server is running successfully!');
+  res.send(`DOBON Server is running! [Game: ${GAME_VERSION}] [File: ${FILE_VERSION}]`);
 });
 
-// 部屋データ管理
 const rooms = {};
 
 const SUITS = ['♠', '♥', '♦', '♣'];
@@ -47,12 +54,10 @@ function getNextTurn(currentTurn, skips, direction, totalPlayers) {
   return next;
 }
 
-// ロビー用の部屋一覧データを生成
 function getLobbyRoomList() {
   const list = [];
   for (let rId in rooms) {
     const r = rooms[rId];
-    // 接続中の人間プレイヤー数をカウント
     const humanCount = r.players.filter(p => !p.isCpu).length;
     list.push({
       id: rId,
@@ -65,15 +70,155 @@ function getLobbyRoomList() {
   return list;
 }
 
-io.on('connection', (socket) => {
-  console.log('接続:', socket.id);
+// サーバー主導のCPU自動思考＆打牌処理
+function handleServerCpuTurn(room) {
+  if (!room || !room.gameStarted || room.isGameOver) return;
+  const currentSeat = room.turnSeatIndex;
+  const player = room.players[currentSeat];
+  if (!player || !player.isCpu) return;
 
-  // ロビーの部屋一覧を要求されたとき
+  setTimeout(() => {
+    if (!room.gameStarted || room.turnSeatIndex !== currentSeat) return;
+
+    const top = room.discardHistory[room.discardHistory.length - 1];
+    
+    // 2ドロー累積中の処理
+    if (room.drawTwoStack > 0) {
+      const idx2 = player.hand.findIndex(c => c && c.val === 2);
+      if (idx2 !== -1) {
+        // CPUが2を重ねる
+        const card2 = player.hand.splice(idx2, 1)[0];
+        room.drawTwoStack += 2;
+        room.discardHistory.push(card2);
+        
+        io.to(room.roomId).emit('card_played_sync', {
+          senderSeatIndex: currentSeat,
+          card: card2,
+          designatedSuit: null,
+          remainingCardCount: player.hand.length,
+          drawTwoStack: room.drawTwoStack,
+          actionType: 'stack_2'
+        });
+
+        if (player.hand.length === 0) {
+          endGameByWin(room, currentSeat, 'NORMAL WIN');
+          return;
+        }
+
+        room.turnSeatIndex = getNextTurn(currentSeat, 0, room.direction, room.players.length);
+        notifyNextTurn(room);
+        return;
+      } else {
+        // CPUがドロー
+        const drawCount = room.drawTwoStack;
+        room.drawTwoStack = 0;
+        for (let i = 0; i < drawCount; i++) {
+          if (room.deck.length > 0) player.hand.push(room.deck.pop());
+        }
+        
+        io.to(room.roomId).emit('card_drawn_sync', {
+          senderSeatIndex: currentSeat,
+          drawCount: drawCount,
+          deckCount: room.deck.length
+        });
+
+        room.turnSeatIndex = getNextTurn(currentSeat, 0, room.direction, room.players.length);
+        notifyNextTurn(room);
+        return;
+      }
+    }
+
+    // 出せるカードを探索
+    const playableIndices = [];
+    player.hand.forEach((c, idx) => {
+      if (!c) return;
+      const suitMatch = room.designatedSuit ? (c.suit === room.designatedSuit) : (c.suit === top.suit);
+      const numMatch = (c.label === top.label);
+      if (suitMatch || numMatch || c.val === 8) {
+        playableIndices.push(idx);
+      }
+    });
+
+    if (playableIndices.length > 0) {
+      const pickIdx = playableIndices[Math.floor(Math.random() * playableIndices.length)];
+      const playedCard = player.hand.splice(pickIdx, 1)[0];
+      room.discardHistory.push(playedCard);
+
+      let skips = 0;
+      let suitChoice = null;
+
+      if (playedCard.val === 8) {
+        const counts = {};
+        player.hand.forEach(c => { if (c) counts[c.suit] = (counts[c.suit] || 0) + 1; });
+        suitChoice = Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0] || '♠';
+        room.designatedSuit = suitChoice;
+      } else {
+        room.designatedSuit = null;
+      }
+
+      if (playedCard.val === 2) room.drawTwoStack += 2;
+      else if (playedCard.val === 9) room.direction *= -1;
+      else if (playedCard.val === 1) skips = 1;
+
+      io.to(room.roomId).emit('card_played_sync', {
+        senderSeatIndex: currentSeat,
+        card: playedCard,
+        designatedSuit: suitChoice,
+        remainingCardCount: player.hand.length,
+        drawTwoStack: room.drawTwoStack,
+        actionType: playedCard.val === 1 ? 'skip' : (playedCard.val === 2 ? 'draw2' : 'normal')
+      });
+
+      if (player.hand.length === 0) {
+        endGameByWin(room, currentSeat, 'NORMAL WIN');
+        return;
+      }
+
+      room.turnSeatIndex = getNextTurn(currentSeat, skips, room.direction, room.players.length);
+      notifyNextTurn(room);
+    } else {
+      // 山札から1枚引く
+      let drawn = null;
+      if (room.deck.length > 0) {
+        drawn = room.deck.pop();
+        player.hand.push(drawn);
+      }
+
+      io.to(room.roomId).emit('card_drawn_sync', {
+        senderSeatIndex: currentSeat,
+        drawCount: 1,
+        deckCount: room.deck.length
+      });
+
+      room.turnSeatIndex = getNextTurn(currentSeat, 0, room.direction, room.players.length);
+      notifyNextTurn(room);
+    }
+  }, 1800);
+}
+
+function notifyNextTurn(room) {
+  io.to(room.roomId).emit('turn_changed_sync', {
+    turnSeatIndex: room.turnSeatIndex,
+    direction: room.direction
+  });
+  handleServerCpuTurn(room);
+}
+
+function endGameByWin(room, winnerSeat, winType) {
+  room.gameStarted = false;
+  room.isGameOver = true;
+  io.to(room.roomId).emit('game_ended_sync', {
+    winnerSeatIndex: winnerSeat,
+    winnerName: room.players[winnerSeat].name,
+    winningType: winType
+  });
+}
+
+io.on('connection', (socket) => {
   socket.on('request_room_list', () => {
     socket.emit('room_list_updated', getLobbyRoomList());
   });
 
-  // 1. 部屋の作成または入室
   socket.on('join_or_create_room', ({ roomId, roomName, playerName, targetPlayerCount }) => {
     socket.join(roomId);
 
@@ -90,14 +235,13 @@ io.on('connection', (socket) => {
         drawTwoStack: 0,
         designatedSuit: null,
         gameStarted: false,
+        isGameOver: false,
         roundNum: 1,
         multiplier: 1
       };
     }
 
     const room = rooms[roomId];
-
-    // ★ゾンビ防止：同じソケットや同名プレイヤーがいたら更新、なければ追加★
     const existingIdx = room.players.findIndex(p => p.id === socket.id || (p.name === playerName && !p.isCpu));
     if (existingIdx !== -1) {
       room.players[existingIdx].id = socket.id;
@@ -122,16 +266,13 @@ io.on('connection', (socket) => {
       gameStarted: room.gameStarted
     });
 
-    // 全体のロビー一覧も更新
     io.emit('room_list_updated', getLobbyRoomList());
   });
 
-  // 2. 対局開始（不足人数にCPUを自動追加して同期スタート）
   function startSyncGame(roomId) {
     const room = rooms[roomId];
     if (!room) return;
 
-    // ★不足分をCPUで自動補完（例: 2人ならCPUを2人足して4人にする）★
     const humanPlayers = room.players.filter(p => !p.isCpu);
     room.players = [...humanPlayers];
     const neededCpu = Math.max(0, (room.targetPlayerCount || 4) - room.players.length);
@@ -153,13 +294,12 @@ io.on('connection', (socket) => {
     room.drawTwoStack = 0;
     room.designatedSuit = null;
     room.gameStarted = true;
+    room.isGameOver = false;
 
-    // 5枚ずつ配る
     room.players.forEach(p => {
       p.hand = room.deck.splice(0, 5);
     });
 
-    // 初期場札
     let initCard = room.deck.pop();
     while (initCard.val === 8 || initCard.val === 2) {
       room.deck.unshift(initCard);
@@ -167,7 +307,6 @@ io.on('connection', (socket) => {
     }
     room.discardHistory.push(initCard);
 
-    // 全員に同期送信
     room.players.forEach((p, idx) => {
       if (!p.isCpu) {
         io.to(p.id).emit('game_started_sync', {
@@ -189,19 +328,19 @@ io.on('connection', (socket) => {
     });
 
     io.emit('room_list_updated', getLobbyRoomList());
+    handleServerCpuTurn(room);
   }
 
   socket.on('start_online_game', ({ roomId }) => {
     startSyncGame(roomId);
   });
 
-  // 3. カードを出す（8の二重送信防止 ＆ 手番同期）
   socket.on('play_card', ({ roomId, card, designatedSuit, remainingCardCount }) => {
     const room = rooms[roomId];
-    if (!room) return;
+    if (!room || !room.gameStarted) return;
 
     const senderIdx = room.players.findIndex(p => p.id === socket.id);
-    if (senderIdx === -1) return;
+    if (senderIdx === -1 || senderIdx !== room.turnSeatIndex) return;
 
     room.players[senderIdx].hand.length = remainingCardCount;
     room.discardHistory.push(card);
@@ -212,52 +351,36 @@ io.on('connection', (socket) => {
     else if (card.val === 9) room.direction *= -1;
     else if (card.val === 1) skips = 1;
 
-    // 通常上がり勝利判定
-    if (remainingCardCount === 0) {
-      room.gameStarted = false;
-      io.to(roomId).emit('game_ended_sync', {
-        winnerSeatIndex: senderIdx,
-        winnerName: room.players[senderIdx].name,
-        winningType: 'NORMAL WIN'
-      });
-      return;
-    }
-
-    room.turnSeatIndex = getNextTurn(senderIdx, skips, room.direction, room.players.length);
-
-    // 部屋の他プレイヤーへ同期
     socket.to(roomId).emit('card_played_sync', {
       senderSeatIndex: senderIdx,
       card: card,
       designatedSuit: designatedSuit,
       remainingCardCount: remainingCardCount,
-      nextTurnSeatIndex: room.turnSeatIndex,
-      drawTwoStack: room.drawTwoStack
+      drawTwoStack: room.drawTwoStack,
+      actionType: card.val === 1 ? 'skip' : (card.val === 2 ? 'draw2' : 'normal')
     });
+
+    if (remainingCardCount === 0) {
+      endGameByWin(room, senderIdx, 'NORMAL WIN');
+      return;
+    }
+
+    room.turnSeatIndex = getNextTurn(senderIdx, skips, room.direction, room.players.length);
+    notifyNextTurn(room);
   });
 
-  // 4. 山札を引く
   socket.on('draw_card', ({ roomId, count }) => {
     const room = rooms[roomId];
-    if (!room) return;
+    if (!room || !room.gameStarted) return;
 
     const senderIdx = room.players.findIndex(p => p.id === socket.id);
-    if (senderIdx === -1) return;
+    if (senderIdx === -1 || senderIdx !== room.turnSeatIndex) return;
 
     const drawCount = count || (room.drawTwoStack > 0 ? room.drawTwoStack : 1);
     room.drawTwoStack = 0;
     const drawnCards = [];
 
     for (let i = 0; i < drawCount; i++) {
-      if (room.deck.length === 0 && room.discardHistory.length > 1) {
-        const top = room.discardHistory.pop();
-        room.deck = room.discardHistory.slice();
-        room.discardHistory = [top];
-        for (let j = room.deck.length - 1; j > 0; j--) {
-          const r = Math.floor(Math.random() * (j + 1));
-          [room.deck[j], room.deck[r]] = [room.deck[r], room.deck[j]];
-        }
-      }
       if (room.deck.length > 0) drawnCards.push(room.deck.pop());
     }
 
@@ -266,22 +389,24 @@ io.on('connection', (socket) => {
       deckCount: room.deck.length
     });
 
-    room.turnSeatIndex = getNextTurn(senderIdx, 0, room.direction, room.players.length);
-
     socket.to(roomId).emit('card_drawn_sync', {
       senderSeatIndex: senderIdx,
       drawCount: drawnCards.length,
-      deckCount: room.deck.length,
-      nextTurnSeatIndex: room.turnSeatIndex
+      deckCount: room.deck.length
     });
+
+    room.turnSeatIndex = getNextTurn(senderIdx, 0, room.direction, room.players.length);
+    notifyNextTurn(room);
   });
 
-  // 5. チョンボ発生（勝者なし・全員に×2倍を同期通知）
+  // チョンボ発生（ドロー2完全リセット＆次回倍率2倍）
   socket.on('chombo_occurred', ({ roomId, offenderSeatIndex, reason }) => {
     const room = rooms[roomId];
     if (!room) return;
+    room.drawTwoStack = 0; // 確実にクリア
     room.multiplier *= 2;
     room.gameStarted = false;
+    room.isGameOver = true;
 
     io.to(roomId).emit('chombo_synced', {
       offenderSeatIndex: offenderSeatIndex,
@@ -291,7 +416,6 @@ io.on('connection', (socket) => {
     });
   });
 
-  // 6. 次のラウンドへ移行
   socket.on('request_next_round', ({ roomId }) => {
     const room = rooms[roomId];
     if (!room) return;
@@ -299,7 +423,6 @@ io.on('connection', (socket) => {
     startSyncGame(roomId);
   });
 
-  // ★切断時のゾンビ完全消去★
   socket.on('disconnect', () => {
     for (let rId in rooms) {
       const room = rooms[rId];
@@ -307,7 +430,7 @@ io.on('connection', (socket) => {
       if (pIdx !== -1) {
         room.players.splice(pIdx, 1);
         if (room.players.filter(p => !p.isCpu).length === 0) {
-          delete rooms[rId]; // 人間がゼロになったら部屋削除
+          delete rooms[rId];
         } else {
           io.to(rId).emit('room_detail_updated', {
             roomId: rId,
@@ -322,4 +445,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`[${FILE_VERSION}] Server running on port ${PORT}`));
