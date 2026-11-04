@@ -1,7 +1,7 @@
 /**
  * DOBON Realtime Game Server
- * Game Version: 2026.00.001
- * File Version: server.js v0.1.0
+ * Game Version: 2026.00.002
+ * File Version: server.js v0.1.1
  */
 
 const express = require('express');
@@ -17,8 +17,8 @@ const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-const GAME_VERSION = "2026.00.001";
-const FILE_VERSION = "server.js v0.1.0";
+const GAME_VERSION = "2026.00.002";
+const FILE_VERSION = "server.js v0.1.1";
 
 app.get('/', (req, res) => {
   res.send(`DOBON Server is running! [Game: ${GAME_VERSION}] [File: ${FILE_VERSION}]`);
@@ -70,7 +70,7 @@ function getLobbyRoomList() {
   return list;
 }
 
-// サーバー主導のCPU自動思考＆打牌処理
+// サーバー主導のCPU自動思考＆打牌
 function handleServerCpuTurn(room) {
   if (!room || !room.gameStarted || room.isGameOver) return;
   const currentSeat = room.turnSeatIndex;
@@ -78,15 +78,14 @@ function handleServerCpuTurn(room) {
   if (!player || !player.isCpu) return;
 
   setTimeout(() => {
-    if (!room.gameStarted || room.turnSeatIndex !== currentSeat) return;
+    if (!room.gameStarted || room.turnSeatIndex !== currentSeat || room.isGameOver) return;
 
     const top = room.discardHistory[room.discardHistory.length - 1];
     
-    // 2ドロー累積中の処理
+    // 2ドロー累積時
     if (room.drawTwoStack > 0) {
       const idx2 = player.hand.findIndex(c => c && c.val === 2);
       if (idx2 !== -1) {
-        // CPUが2を重ねる
         const card2 = player.hand.splice(idx2, 1)[0];
         room.drawTwoStack += 2;
         room.discardHistory.push(card2);
@@ -96,8 +95,7 @@ function handleServerCpuTurn(room) {
           card: card2,
           designatedSuit: null,
           remainingCardCount: player.hand.length,
-          drawTwoStack: room.drawTwoStack,
-          actionType: 'stack_2'
+          drawTwoStack: room.drawTwoStack
         });
 
         if (player.hand.length === 0) {
@@ -109,9 +107,8 @@ function handleServerCpuTurn(room) {
         notifyNextTurn(room);
         return;
       } else {
-        // CPUがドロー
         const drawCount = room.drawTwoStack;
-        room.drawTwoStack = 0;
+        room.drawTwoStack = 0; // ドロー処理完了で確実にゼロ
         for (let i = 0; i < drawCount; i++) {
           if (room.deck.length > 0) player.hand.push(room.deck.pop());
         }
@@ -165,8 +162,7 @@ function handleServerCpuTurn(room) {
         card: playedCard,
         designatedSuit: suitChoice,
         remainingCardCount: player.hand.length,
-        drawTwoStack: room.drawTwoStack,
-        actionType: playedCard.val === 1 ? 'skip' : (playedCard.val === 2 ? 'draw2' : 'normal')
+        drawTwoStack: room.drawTwoStack
       });
 
       if (player.hand.length === 0) {
@@ -177,7 +173,6 @@ function handleServerCpuTurn(room) {
       room.turnSeatIndex = getNextTurn(currentSeat, skips, room.direction, room.players.length);
       notifyNextTurn(room);
     } else {
-      // 山札から1枚引く
       let drawn = null;
       if (room.deck.length > 0) {
         drawn = room.deck.pop();
@@ -193,7 +188,7 @@ function handleServerCpuTurn(room) {
       room.turnSeatIndex = getNextTurn(currentSeat, 0, room.direction, room.players.length);
       notifyNextTurn(room);
     }
-  }, 1800);
+  }, 1600);
 }
 
 function notifyNextTurn(room) {
@@ -204,9 +199,13 @@ function notifyNextTurn(room) {
   handleServerCpuTurn(room);
 }
 
+// 勝敗決定時（勝者を次ゲームの開始役に記憶）
 function endGameByWin(room, winnerSeat, winType) {
   room.gameStarted = false;
   room.isGameOver = true;
+  room.drawTwoStack = 0; // ドロー2クリア
+  room.nextRoundStarter = winnerSeat; // ★勝者を次回スタート役に記憶★
+
   io.to(room.roomId).emit('game_ended_sync', {
     winnerSeatIndex: winnerSeat,
     winnerName: room.players[winnerSeat].name,
@@ -231,6 +230,7 @@ io.on('connection', (socket) => {
         deck: [],
         discardHistory: [],
         turnSeatIndex: 0,
+        nextRoundStarter: 0, // 初回は席0スタート
         direction: 1,
         drawTwoStack: 0,
         designatedSuit: null,
@@ -269,6 +269,7 @@ io.on('connection', (socket) => {
     io.emit('room_list_updated', getLobbyRoomList());
   });
 
+  // 対局開始（新ラウンド）
   function startSyncGame(roomId) {
     const room = rooms[roomId];
     if (!room) return;
@@ -289,12 +290,15 @@ io.on('connection', (socket) => {
 
     room.deck = createShuffledDeck();
     room.discardHistory = [];
-    room.turnSeatIndex = 0;
     room.direction = 1;
-    room.drawTwoStack = 0;
+    room.drawTwoStack = 0; // 新ラウンドは確実にドロー2ゼロ
     room.designatedSuit = null;
     room.gameStarted = true;
     room.isGameOver = false;
+
+    // ★勝者（またはチョンボ者）から手番スタート！★
+    room.turnSeatIndex = (room.nextRoundStarter !== undefined) ? room.nextRoundStarter : 0;
+    if (room.turnSeatIndex >= room.players.length) room.turnSeatIndex = 0;
 
     room.players.forEach(p => {
       p.hand = room.deck.splice(0, 5);
@@ -328,6 +332,8 @@ io.on('connection', (socket) => {
     });
 
     io.emit('room_list_updated', getLobbyRoomList());
+    
+    // もしCPUスタートなら即座に打牌開始
     handleServerCpuTurn(room);
   }
 
@@ -337,7 +343,7 @@ io.on('connection', (socket) => {
 
   socket.on('play_card', ({ roomId, card, designatedSuit, remainingCardCount }) => {
     const room = rooms[roomId];
-    if (!room || !room.gameStarted) return;
+    if (!room || !room.gameStarted || room.isGameOver) return;
 
     const senderIdx = room.players.findIndex(p => p.id === socket.id);
     if (senderIdx === -1 || senderIdx !== room.turnSeatIndex) return;
@@ -356,8 +362,7 @@ io.on('connection', (socket) => {
       card: card,
       designatedSuit: designatedSuit,
       remainingCardCount: remainingCardCount,
-      drawTwoStack: room.drawTwoStack,
-      actionType: card.val === 1 ? 'skip' : (card.val === 2 ? 'draw2' : 'normal')
+      drawTwoStack: room.drawTwoStack
     });
 
     if (remainingCardCount === 0) {
@@ -371,7 +376,7 @@ io.on('connection', (socket) => {
 
   socket.on('draw_card', ({ roomId, count }) => {
     const room = rooms[roomId];
-    if (!room || !room.gameStarted) return;
+    if (!room || !room.gameStarted || room.isGameOver) return;
 
     const senderIdx = room.players.findIndex(p => p.id === socket.id);
     if (senderIdx === -1 || senderIdx !== room.turnSeatIndex) return;
@@ -399,14 +404,14 @@ io.on('connection', (socket) => {
     notifyNextTurn(room);
   });
 
-  // チョンボ発生（ドロー2完全リセット＆次回倍率2倍）
   socket.on('chombo_occurred', ({ roomId, offenderSeatIndex, reason }) => {
     const room = rooms[roomId];
     if (!room) return;
-    room.drawTwoStack = 0; // 確実にクリア
+    room.drawTwoStack = 0; // ドロー2クリア
     room.multiplier *= 2;
     room.gameStarted = false;
     room.isGameOver = true;
+    room.nextRoundStarter = offenderSeatIndex; // チョンボ者が次回スタート
 
     io.to(roomId).emit('chombo_synced', {
       offenderSeatIndex: offenderSeatIndex,
