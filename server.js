@@ -1,9 +1,8 @@
 /**
  * DOBON Realtime Game Server
- * Game Version: 2026.00.006
- * File Version: server.js v0.1.4
- * Updates: Direction fixed to Counter-Clockwise (-1),
- *          Winner-First Start, Auto-CPU, Turn Sync & Room History.
+ * Game Version: 2026.00.007
+ * File Version: server.js v0.1.5
+ * Updates: Next Round synchronization, 30s timeout auto-advance, player score sync and round history.
  */
 
 const express = require('express');
@@ -19,8 +18,8 @@ const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-const GAME_VERSION = "2026.00.006";
-const FILE_VERSION = "server.js v0.1.4";
+const GAME_VERSION = "2026.00.007";
+const FILE_VERSION = "server.js v0.1.5";
 
 app.get('/', (req, res) => {
   res.send(`DOBON Server is running! [Game: ${GAME_VERSION}] [File: ${FILE_VERSION}]`);
@@ -241,16 +240,47 @@ function notifyNextTurn(room) {
   }
 }
 
-function recordRoomHistory(room, type, winnerName, loserName, points) {
+function recordRoomHistory(room, type, winnerName, loserName, points, deltas) {
   if (!room.history) room.history = [];
   room.history.push({
-    round: room.roundNum,
+    round: room.roundNum || 1,
     type: type,
     winner: winnerName,
     loser: loserName || '全員',
     points: points,
+    deltas: deltas || room.players.map(() => 0),
     scoresAfter: room.players.map(p => ({ name: p.name, score: p.score }))
   });
+}
+
+function scheduleNextRound(room) {
+  if (!room) return;
+  if (room.nextRoundTimer) {
+    clearTimeout(room.nextRoundTimer);
+    room.nextRoundTimer = null;
+  }
+  room.readyPlayers = new Set();
+  room.waitingNextRound = true;
+
+  // 30秒タイマー：誰も操作しない場合は自動的に次ラウンド開始
+  const TIMEOUT_SEC = 30;
+  room.nextRoundTimer = setTimeout(() => {
+    if (room && room.waitingNextRound) {
+      advanceToNextRound(room);
+    }
+  }, TIMEOUT_SEC * 1000);
+}
+
+function advanceToNextRound(room) {
+  if (!room) return;
+  if (room.nextRoundTimer) {
+    clearTimeout(room.nextRoundTimer);
+    room.nextRoundTimer = null;
+  }
+  room.waitingNextRound = false;
+  room.readyPlayers = new Set();
+  room.roundNum = (room.roundNum || 1) + 1;
+  startSyncGame(room.roomId);
 }
 
 function endGameByWin(room, winnerSeat, winType) {
@@ -261,16 +291,40 @@ function endGameByWin(room, winnerSeat, winType) {
   room.nextRoundStarter = winnerSeat; // 勝者が次回スタート！
 
   const winner = room.players[winnerSeat];
-  recordRoomHistory(room, winType, winner ? winner.name : 'Winner', null, 0);
+  const mult = room.multiplier || 1;
+  const deltas = new Array(room.players.length).fill(0);
+  let totalWin = 0;
+
+  room.players.forEach((p, idx) => {
+    if (idx !== winnerSeat) {
+      const cardCount = p.hand ? p.hand.length : 0;
+      const lost = cardCount * 1 * mult;
+      p.score = (p.score || 0) - lost;
+      deltas[idx] = -lost;
+      totalWin += lost;
+    }
+  });
+  if (winner) {
+    winner.score = (winner.score || 0) + totalWin;
+    deltas[winnerSeat] = totalWin;
+  }
+
+  recordRoomHistory(room, winType, winner ? winner.name : 'Winner', '全員', totalWin, deltas);
 
   cleanupRoomCapacity(room);
   promoteSpectatorsToPlayers(room);
+
+  scheduleNextRound(room);
 
   io.to(room.roomId).emit('game_ended_sync', {
     winnerSeatIndex: winnerSeat,
     winnerName: winner ? winner.name : 'Winner',
     winningType: winType,
-    roomHistory: room.history
+    points: totalWin,
+    playerScores: room.players.map(p => ({ seatIndex: p.seatIndex, name: p.name, score: p.score, delta: deltas[p.seatIndex] || 0 })),
+    roomHistory: room.history,
+    currentRound: room.roundNum || 1,
+    nextRoundTimeoutSec: 30
   });
 
   io.emit('room_list_updated', getLobbyRoomList());
@@ -331,23 +385,35 @@ function startSyncGame(roomId) {
   if (!room) return;
 
   clearTimeout(room.turnTimer);
+  if (room.nextRoundTimer) {
+    clearTimeout(room.nextRoundTimer);
+    room.nextRoundTimer = null;
+  }
+  room.waitingNextRound = false;
+  room.readyPlayers = new Set();
 
   const humanPlayers = room.players.filter(p => !p.isCpu);
+  const existingCpus = room.players.filter(p => p.isCpu);
   room.players = [...humanPlayers];
   const neededCpu = Math.max(0, room.targetPlayerCount - room.players.length);
 
-  for (let i = 1; i <= neededCpu; i++) {
-    room.players.push({
-      id: `cpu_${Date.now()}_${i}`,
-      name: `CPU ${i}`,
-      hand: [],
-      score: 0,
-      isCpu: true
-    });
+  for (let i = 0; i < neededCpu; i++) {
+    if (existingCpus[i]) {
+      room.players.push(existingCpus[i]);
+    } else {
+      room.players.push({
+        id: `cpu_${Date.now()}_${i + 1}`,
+        name: `CPU ${i + 1}`,
+        hand: [],
+        score: 0,
+        isCpu: true
+      });
+    }
   }
 
   room.players.forEach((p, idx) => {
     p.seatIndex = idx;
+    if (p.score === undefined) p.score = 0;
   });
 
   room.deck = createShuffledDeck();
@@ -386,12 +452,13 @@ function startSyncGame(roomId) {
           seatIndex: oIdx,
           name: other.name,
           cardCount: other.hand.length,
+          score: other.score || 0,
           isCpu: other.isCpu
         })),
         initialCard: initCard,
         deckCount: room.deck.length,
         turnSeatIndex: room.turnSeatIndex,
-        roundNum: room.roundNum,
+        roundNum: room.roundNum || 1,
         multiplier: room.multiplier,
         timeLimit: room.timeLimit,
         roomHistory: room.history || []
@@ -409,12 +476,13 @@ function startSyncGame(roomId) {
           seatIndex: oIdx,
           name: other.name,
           cardCount: other.hand.length,
+          score: other.score || 0,
           isCpu: other.isCpu
         })),
         initialCard: initCard,
         deckCount: room.deck.length,
         turnSeatIndex: room.turnSeatIndex,
-        roundNum: room.roundNum,
+        roundNum: room.roundNum || 1,
         multiplier: room.multiplier,
         timeLimit: room.timeLimit,
         roomHistory: room.history || []
@@ -670,14 +738,20 @@ io.on('connection', (socket) => {
 
     const winner = room.players[winnerSeatIndex];
     const loser = room.players[loserSeatIndex];
+    const deltas = new Array(room.players.length).fill(0);
+
     if (winner && loser) {
       winner.score += points;
       loser.score -= points;
-      recordRoomHistory(room, winType, winner.name, loser.name, points);
+      deltas[winnerSeatIndex] = points;
+      deltas[loserSeatIndex] = -points;
+      recordRoomHistory(room, winType, winner.name, loser.name, points, deltas);
     }
 
     cleanupRoomCapacity(room);
     promoteSpectatorsToPlayers(room);
+
+    scheduleNextRound(room);
 
     io.to(roomId).emit('dobon_result_broadcast', {
       winnerSeatIndex: winnerSeatIndex,
@@ -687,7 +761,10 @@ io.on('connection', (socket) => {
       winType: winType,
       points: points,
       loserHandCount: loserHandCount,
-      roomHistory: room.history
+      playerScores: room.players.map(p => ({ seatIndex: p.seatIndex, name: p.name, score: p.score, delta: deltas[p.seatIndex] || 0 })),
+      roomHistory: room.history,
+      currentRound: room.roundNum || 1,
+      nextRoundTimeoutSec: 30
     });
 
     io.emit('room_list_updated', getLobbyRoomList());
@@ -698,25 +775,69 @@ io.on('connection', (socket) => {
     if (!room) return;
     clearTimeout(room.turnTimer);
     room.drawTwoStack = 0;
+    const prevMult = room.multiplier || 1;
     room.multiplier *= 2;
     room.gameStarted = false;
     room.isGameOver = true;
     room.nextRoundStarter = offenderSeatIndex; // チョンボ者が次回スタート
 
-    recordRoomHistory(room, 'CHOMBO', 'なし', room.players[offenderSeatIndex] ? room.players[offenderSeatIndex].name : 'Player', 0);
+    const penalty = 5 * prevMult;
+    let totalFine = 0;
+    const deltas = new Array(room.players.length).fill(0);
+
+    room.players.forEach((p, idx) => {
+      if (idx !== offenderSeatIndex) {
+        p.score = (p.score || 0) + penalty;
+        deltas[idx] = penalty;
+        totalFine += penalty;
+      }
+    });
+    if (room.players[offenderSeatIndex]) {
+      room.players[offenderSeatIndex].score = (room.players[offenderSeatIndex].score || 0) - totalFine;
+      deltas[offenderSeatIndex] = -totalFine;
+    }
+
+    const offender = room.players[offenderSeatIndex];
+    recordRoomHistory(room, 'CHOMBO', 'なし', offender ? offender.name : 'Player', totalFine, deltas);
 
     cleanupRoomCapacity(room);
     promoteSpectatorsToPlayers(room);
 
+    scheduleNextRound(room);
+
     io.to(roomId).emit('chombo_synced', {
       offenderSeatIndex: offenderSeatIndex,
-      offenderName: room.players[offenderSeatIndex] ? room.players[offenderSeatIndex].name : 'Player',
+      offenderName: offender ? offender.name : 'Player',
       reason: reason,
       newMultiplier: room.multiplier,
-      roomHistory: room.history
+      playerScores: room.players.map(p => ({ seatIndex: p.seatIndex, name: p.name, score: p.score, delta: deltas[p.seatIndex] || 0 })),
+      roomHistory: room.history,
+      currentRound: room.roundNum || 1,
+      nextRoundTimeoutSec: 30
     });
 
     io.emit('room_list_updated', getLobbyRoomList());
+  });
+
+  socket.on('request_next_round', ({ roomId }) => {
+    const room = rooms[roomId];
+    if (!room || !room.waitingNextRound) return;
+
+    room.readyPlayers.add(socket.id);
+
+    const humanPlayers = room.players.filter(p => !p.isCpu);
+    const readyCount = room.players.filter(p => p.isCpu || room.readyPlayers.has(p.id)).length;
+    const totalCount = room.players.length;
+
+    io.to(roomId).emit('next_round_status', {
+      readyCount: readyCount,
+      totalCount: totalCount,
+      readyPlayerIds: Array.from(room.readyPlayers)
+    });
+
+    if (humanPlayers.length === 0 || humanPlayers.every(p => room.readyPlayers.has(p.id))) {
+      advanceToNextRound(room);
+    }
   });
 
   socket.on('disconnect', () => {
@@ -742,8 +863,19 @@ io.on('connection', (socket) => {
           room.players.splice(pIdx, 1);
         }
 
+        if (room.waitingNextRound) {
+          const humanPlayers = room.players.filter(pl => !pl.isCpu);
+          if (humanPlayers.length === 0 || humanPlayers.every(pl => room.readyPlayers.has(pl.id))) {
+            advanceToNextRound(room);
+          }
+        }
+
         if (room.players.filter(pl => !pl.isCpu).length === 0 && (!room.spectators || room.spectators.length === 0)) {
           clearTimeout(room.turnTimer);
+          if (room.nextRoundTimer) {
+            clearTimeout(room.nextRoundTimer);
+            room.nextRoundTimer = null;
+          }
           delete rooms[rId];
         }
       }
