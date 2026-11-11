@@ -1,8 +1,8 @@
 /**
  * DOBON Realtime Game Server
  * Game Version: 2026.00.007
- * File Version: server.js v0.1.5
- * Updates: Next Round synchronization, 30s timeout auto-advance, player score sync and round history.
+ * File Version: server.js v0.1.6
+ * Updates: Initial 9 reversal, Pon/Kan synchronization & next-turn progression, 30s auto-advance.
  */
 
 const express = require('express');
@@ -19,7 +19,7 @@ const io = new Server(server, {
 });
 
 const GAME_VERSION = "2026.00.007";
-const FILE_VERSION = "server.js v0.1.5";
+const FILE_VERSION = "server.js v0.1.6";
 
 app.get('/', (req, res) => {
   res.send(`DOBON Server is running! [Game: ${GAME_VERSION}] [File: ${FILE_VERSION}]`);
@@ -288,7 +288,7 @@ function endGameByWin(room, winnerSeat, winType) {
   room.gameStarted = false;
   room.isGameOver = true;
   room.drawTwoStack = 0;
-  room.nextRoundStarter = winnerSeat; // 勝者が次回スタート！
+  room.nextRoundStarter = winnerSeat; // 勝者が次回スタート
 
   const winner = room.players[winnerSeat];
   const mult = room.multiplier || 1;
@@ -379,7 +379,7 @@ function promoteSpectatorsToPlayers(room) {
   }
 }
 
-// 新ラウンドの同期開始（★初期方向を反時計回り -1 に統一★）
+// 新ラウンドの同期開始
 function startSyncGame(roomId) {
   const room = rooms[roomId];
   if (!room) return;
@@ -418,8 +418,7 @@ function startSyncGame(roomId) {
 
   room.deck = createShuffledDeck();
   room.discardHistory = [];
-  // ★重要：公式ルールブック準拠で反時計回り（-1）に統一★
-  room.direction = -1;
+  room.direction = -1; // 初期：反時計回り
   room.drawTwoStack = 0;
   room.designatedSuit = null;
   room.gameStarted = true;
@@ -442,6 +441,11 @@ function startSyncGame(roomId) {
   }
   room.discardHistory.push(initCard);
 
+  // ★初めから9が出ているときは、最初から逆回り（時計回り 1）に反転★
+  if (initCard.val === 9) {
+    room.direction = 1;
+  }
+
   room.players.forEach((p, idx) => {
     if (!p.isCpu) {
       io.to(p.id).emit('game_started_sync', {
@@ -458,6 +462,7 @@ function startSyncGame(roomId) {
         initialCard: initCard,
         deckCount: room.deck.length,
         turnSeatIndex: room.turnSeatIndex,
+        direction: room.direction,
         roundNum: room.roundNum || 1,
         multiplier: room.multiplier,
         timeLimit: room.timeLimit,
@@ -482,6 +487,7 @@ function startSyncGame(roomId) {
         initialCard: initCard,
         deckCount: room.deck.length,
         turnSeatIndex: room.turnSeatIndex,
+        direction: room.direction,
         roundNum: room.roundNum || 1,
         multiplier: room.multiplier,
         timeLimit: room.timeLimit,
@@ -535,7 +541,7 @@ io.on('connection', (socket) => {
         discardHistory: [],
         turnSeatIndex: 0,
         nextRoundStarter: 0,
-        direction: -1, // ★初期値：反時計回り★
+        direction: -1,
         drawTwoStack: 0,
         designatedSuit: null,
         gameStarted: false,
@@ -726,6 +732,46 @@ io.on('connection', (socket) => {
     notifyNextTurn(room);
   });
 
+  // ★ポン・カン確定後の手番進行同期★
+  socket.on('confirm_naki_sync', ({ roomId, actorSeatIndex, cards, remainingCardCount }) => {
+    const room = rooms[roomId];
+    if (!room || !room.gameStarted || room.isGameOver) return;
+
+    room.isNakiPaused = false;
+    const player = room.players[actorSeatIndex];
+    if (!player) return;
+
+    player.hand.length = remainingCardCount;
+    cards.forEach(c => room.discardHistory.push(c));
+
+    const val = cards[0].val;
+    const isKan = (cards.length === 3);
+
+    if (val === 2) {
+      room.drawTwoStack += (isKan ? 6 : 4);
+    }
+    let skips = 0;
+    if (val === 1) skips = isKan ? 3 : 2;
+    if (val === 9 && isKan) room.direction *= -1;
+
+    socket.to(roomId).emit('naki_confirmed_sync', {
+      actorSeatIndex: actorSeatIndex,
+      cards: cards,
+      remainingCardCount: remainingCardCount,
+      drawTwoStack: room.drawTwoStack,
+      direction: room.direction
+    });
+
+    if (remainingCardCount === 0) {
+      endGameByWin(room, actorSeatIndex, isKan ? 'KAN WIN' : 'PON WIN');
+      return;
+    }
+
+    // ポン（カン）した人の次の人の手番へ進める
+    room.turnSeatIndex = getNextTurn(actorSeatIndex, skips, room.direction, room.players.length);
+    notifyNextTurn(room);
+  });
+
   socket.on('dobon_declared_sync', ({ roomId, winnerSeatIndex, loserSeatIndex, winType, points, loserHandCount }) => {
     const room = rooms[roomId];
     if (!room) return;
@@ -734,7 +780,7 @@ io.on('connection', (socket) => {
     room.gameStarted = false;
     room.isGameOver = true;
     room.drawTwoStack = 0;
-    room.nextRoundStarter = winnerSeatIndex; // 勝者が次回スタート！
+    room.nextRoundStarter = winnerSeatIndex; // 勝者が次回スタート
 
     const winner = room.players[winnerSeatIndex];
     const loser = room.players[loserSeatIndex];
